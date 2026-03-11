@@ -169,21 +169,21 @@ async def send_pick(target, cat_name: str, items: list):
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    get_categories(context)
-    await update.message.reply_text(
-        "👋 *Random Picker Bot*\n\n"
-        "*Commands:*\n"
-        "• /pick — pick from a category (interactive)\n"
-        "• /list — show all categories & items\n"
-        "• /additem `<category> | <item>` — add an item\n"
-        "• /removeitem `<category> | <item>` — remove an item\n"
-        "• /addcategory `<name>` — create a new category\n"
-        "• /removecategory `<name>` — delete a category\n"
-        "• /calendar `<event name>` — get a Google Calendar link\n\n"
-        "*Quick pick:* just type a category name or number anytime! 🎲",
-        parse_mode="Markdown"
+    welcome_message = (
+        "👋 *Welcome to the Random Picker Bot!*\n\n"
+        "I can help you randomly decide where to eat, what to watch, or what to do.\n\n"
+        "Here are some commands to get you started:\n"
+        "📌 /list - See all your categories\n"
+        "🎲 /pick - Pick a random item from a category\n"
+        "➕ /additem - Add a new item to a category\n"
+        "❓ /help - Show this message again"
     )
-
+    
+    # Send the message back to the user
+    await update.message.reply_text(
+        welcome_message, 
+        parse_mode="Markdown" # This allows you to use bold (*) and italics (_)
+    )
 
 async def list_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cats = get_categories(context)
