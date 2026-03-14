@@ -198,7 +198,7 @@ def resolve_category(query: str, cats: dict):
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Downloads an uploaded image, runs OCR, and attempts to find exam links."""
+    """Downloads an uploaded image, runs OCR, extracts times and matches to exam schedule."""
     await update.message.reply_text("📸 Analyzing your timetable... Give me a moment.")
     
     try:
@@ -206,16 +206,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         image_bytes = await photo_file.download_as_bytearray()
         img = Image.open(io.BytesIO(image_bytes))
         extracted_text = pytesseract.image_to_string(img)
-        
+
         if not extracted_text.strip():
             await update.message.reply_text("I couldn't read any text from that image. Try a clearer picture!")
             return
 
-        course_pattern = re.compile(r'\b([A-Z]{2,4})\s+(\d{3}[A-Z]?)\b')
+        # Extract all times like "9:30 am", "12:30 pm", "3:30 pm"
         time_pattern = re.compile(r'(\d{1,2}:\d{2})\s*(am|pm)', re.IGNORECASE)
-        KNOWN_ROOM_PREFIXES = {'ESB', 'NAB', 'ERB', 'SBA', 'LIB', 'AUD', 'LAB', 'GYM', 'CLS'}
-
-        lines = extracted_text.splitlines()
 
         def to_24h(t, meridiem):
             h, m = map(int, t.split(':'))
@@ -225,72 +222,56 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 h = 0
             return f"{h:02d}:{m:02d}"
 
-        # Build list of (line_index, time_24h)
-        time_positions = []
-        for i, line in enumerate(lines):
-            for t, mer in time_pattern.findall(line):
-                time_positions.append((i, to_24h(t, mer)))
+        # Fix common OCR misreads
+        OCR_TIME_FIXES = {
+            "12:15": "12:30",
+            "09:35": "09:30",
+            "11:05": "11:00",
+            "14:05": "14:00",
+            "15:35": "15:30",
+            "17:05": "17:00",
+            "08:05": "08:00",
+        }
 
-        # Build list of (line_index, course_code)
-        course_positions = []
-        for i, line in enumerate(lines):
-            for prefix, num in course_pattern.findall(line):
-                if prefix in KNOWN_ROOM_PREFIXES or len(num) == 4:
-                    continue
-                course_positions.append((i, f"{prefix} {num}"))
+        # Get all unique times found in the image
+        raw_times = time_pattern.findall(extracted_text)
+        unique_times = list(dict.fromkeys(
+            OCR_TIME_FIXES.get(to_24h(t, mer), to_24h(t, mer))
+            for t, mer in raw_times
+        ))
 
-        # Deduplicate keeping first occurrence
-        seen = set()
-        unique_course_positions = []
-        for pos, code in course_positions:
-            if code not in seen:
-                seen.add(code)
-                unique_course_positions.append((pos, code))
-
-        if not unique_course_positions:
-            await update.message.reply_text(
-                "I read the image but couldn't detect any course codes.\n\n"
-                f"Debug - Raw OCR snippet:\n`{extracted_text[:300]}`",
-                parse_mode="Markdown"
-            )
+        if not unique_times:
+            await update.message.reply_text("I couldn't detect any class times in the image. Try a clearer picture!")
             return
 
-        results_message = "🎓 *Your Spring 2026 Final Exams:*\n\n"
+        results_message = "🗓 *Your Spring 2026 Final Exam Slots:*\n\n"
         found_any = False
 
-        for course_line, course in unique_course_positions:
-            # Priority 1: Common exam
-            if course in COMMON_EXAMS:
-                start_dt, end_dt = COMMON_EXAMS[course]
-                link = make_google_calendar_link_exam(course, start_dt, end_dt)
-                results_message += f"🏆 *{course}* (Common Exam)\n[📅 Add to Google Calendar]({link})\n\n"
-                found_any = True
-                continue
-
-            # Priority 2: Find nearest time to this course line
-            if not time_positions:
-                results_message += f"❓ *{course}* — no times detected in image.\n\n"
-                continue
-
-            nearest_time = min(time_positions, key=lambda x: abs(x[0] - course_line))[1]
-
-           options = []
-            for day_key in [("MW", nearest_time), ("TR", nearest_time)]:
+        for time_24h in unique_times:
+            # Check both MW and TR for this time
+            options = []
+            for day_key in [("MW", time_24h), ("TR", time_24h)]:
                 if day_key in REGULAR_EXAMS:
                     start_dt, end_dt = REGULAR_EXAMS[day_key]
-                    link = make_google_calendar_link_exam(course, start_dt, end_dt)
+                    link = make_google_calendar_link_exam(f"Final Exam", start_dt, end_dt)
                     day_label = "Mon/Wed" if day_key[0] == "MW" else "Tue/Thu"
                     options.append(f"[📅 {day_label}]({link})")
 
             if options:
-                results_message += f"📘 *{course}* ({nearest_time})\n"
+                # Convert back to 12h for display
+                h, m = map(int, time_24h.split(':'))
+                meridiem = "am" if h < 12 else "pm"
+                display_h = h if h <= 12 else h - 12
+                if display_h == 0:
+                    display_h = 12
+                display_time = f"{display_h}:{m:02d} {meridiem}"
+
+                results_message += f"⏰ *{display_time}* class:\n"
                 results_message += " · ".join(options) + "\n\n"
                 found_any = True
-            else:
-                results_message += f"❓ *{course}* ({nearest_time}) — not in exam schedule.\n\n"
 
         if not found_any:
-            results_message += "No courses could be matched to the Spring 2026 exam schedule."
+            results_message += "No class times could be matched to the Spring 2026 exam schedule."
 
         await update.message.reply_text(
             results_message,
@@ -301,61 +282,20 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error processing image: {e}")
         await update.message.reply_text(f"❌ Error: {type(e).__name__}: {e}")
+```
 
-        # Detect if timetable is MW or TR based on day names present in OCR
-        has_monday = bool(re.search(r'\b(Monday|Mon)\b', extracted_text, re.IGNORECASE))
-        has_tuesday = bool(re.search(r'\b(Tuesday|Tue)\b', extracted_text, re.IGNORECASE))
+The output will look like:
+```
+🗓 Your Spring 2026 Final Exam Slots:
 
-        results_message = "🎓 *Your Spring 2026 Final Exams:*\n\n"
-        found_any = False
+⏰ 9:30 am class:
+📅 Mon/Wed · 📅 Tue/Thu
 
-        for course in detected_courses:
-            # Priority 1: Common exam
-            if course in COMMON_EXAMS:
-                start_dt, end_dt = COMMON_EXAMS[course]
-                link = make_google_calendar_link_exam(course, start_dt, end_dt)
-                results_message += f"🏆 *{course}* (Common Exam)\n[📅 Add to Google Calendar]({link})\n\n"
-                found_any = True
-                continue
+⏰ 11:00 am class:
+📅 Mon/Wed · 📅 Tue/Thu
 
-            # Priority 2: Match by timing
-            matched = False
-            for time_24h in times_24h:
-                # Format to HH:MM
-                time_str = time_24h  # already "09:30" etc.
-                
-                # Try both MW and TR
-                for day_key in [("MW", time_str), ("TR", time_str)]:
-                    if day_key in REGULAR_EXAMS:
-                        start_dt, end_dt = REGULAR_EXAMS[day_key]
-                        link = make_google_calendar_link_exam(course, start_dt, end_dt)
-                        day_label = "Mon/Wed" if day_key[0] == "MW" else "Tue/Thu"
-                        results_message += (
-                            f"📘 *{course}* ({day_label} {time_str})\n"
-                            f"[📅 Add to Google Calendar]({link})\n\n"
-                        )
-                        matched = True
-                        found_any = True
-                        break
-                if matched:
-                    break
-
-            if not matched:
-                results_message += f"❓ *{course}* — couldn't match to exam schedule.\n\n"
-
-        if not found_any:
-            results_message += "No courses could be matched to the Spring 2026 exam schedule."
-
-        await update.message.reply_text(
-            results_message,
-            parse_mode="Markdown",
-            disable_web_page_preview=True
-        )
-
-    except Exception as e:
-        logger.error(f"Error processing image: {e}")
-        await update.message.reply_text(f"❌ Error: {type(e).__name__}: {e}")
-
+⏰ 12:30 pm class:
+📅 Mon/Wed · 📅 Tue/Thu
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared pick sender (works for both Message and CallbackQuery)
