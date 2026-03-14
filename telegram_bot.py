@@ -282,20 +282,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error processing image: {e}")
         await update.message.reply_text(f"❌ Error: {type(e).__name__}: {e}")
-```
 
-The output will look like:
-```
-Your Spring 2026 Final Exam Slots:
 
- 9:30 am class:
- Mon/Wed ·  Tue/Thu
-
- 11:00 am class:
- Mon/Wed ·  Tue/Thu
-
- 12:30 pm class:
- Mon/Wed ·  Tue/Thu
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared pick sender (works for both Message and CallbackQuery)
