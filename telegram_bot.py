@@ -202,61 +202,114 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📸 Analyzing your timetable... Give me a moment.")
     
     try:
-        # 1. Download the highest resolution photo sent
         photo_file = await update.message.photo[-1].get_file()
         image_bytes = await photo_file.download_as_bytearray()
-        
-        # Load image for processing
         img = Image.open(io.BytesIO(image_bytes))
-        
-        # 2. Extract Text via OCR
         extracted_text = pytesseract.image_to_string(img)
         
         if not extracted_text.strip():
             await update.message.reply_text("I couldn't read any text from that image. Try a clearer picture!")
             return
 
-        # 3. Data Comparison & Regex parsing 
-        course_pattern = re.compile(r'([A-Z]{3,4})\s*(\d{3}[A-Z]?)')
-        timing_pattern = re.compile(r'(MW|TR|M|T|W|R|F)[\s-]*(\d{1,2}:\d{2})')
+        # Match course codes like INE 331, MTH 203, MCE 216 — but NOT room codes
+        # Room codes have 3-4 chars but are followed by 3-4 digit numbers (e.g. ESB 1014, NAB1 006)
+        # Valid course codes: 3-4 letters, space, exactly 3 digits optionally followed by one letter
+        course_pattern = re.compile(r'\b([A-Z]{2,4})\s+(\d{3}[A-Z]?)\b')
         
-        found_courses = course_pattern.findall(extracted_text)
-        found_timings = timing_pattern.findall(extracted_text)
+        # Match times like "9:30 am", "12:30 pm", "11:00 am"
+        time_pattern = re.compile(r'(\d{1,2}:\d{2})\s*(am|pm)', re.IGNORECASE)
+        
+        # Match day columns from OCR — look for Monday/Tuesday etc. OR MW/TR patterns
+        day_pattern = re.compile(r'\b(Monday|Tuesday|Wednesday|Thursday|Friday|Mon|Tue|Wed|Thu|Fri|MW|TR|MWF)\b', re.IGNORECASE)
 
-        detected_course_codes = [f"{c[0]} {c[1]}" for c in found_courses]
+        # Room number pattern to exclude — 3-4 letters followed by 4-digit number
+        room_pattern = re.compile(r'\b([A-Z]{2,4})\s*(\d{4})\b')
+        room_codes = {f"{m[0]} {m[1]}" for m in room_pattern.findall(extracted_text)}
+        # Also catch rooms like "NAB1 006", "SBA 1107" — 4+ digit rooms
+        room_codes2 = set(re.findall(r'\b(?:ESB|NAB|ERB|SBA|NAB1)[^\n]*', extracted_text))
+
+        all_course_matches = course_pattern.findall(extracted_text)
         
-        if not detected_course_codes:
-            await update.message.reply_text("I read the image, but couldn't detect any standard course codes (e.g., MTH 203).")
+        # Filter out room codes — rooms tend to have 4-digit numbers, courses have 3-digit
+        KNOWN_ROOM_PREFIXES = {'ESB', 'NAB', 'ERB', 'SBA', 'LIB', 'AUD', 'LAB', 'GYM', 'CLS'}
+        detected_courses = []
+        for prefix, num in all_course_matches:
+            if prefix in KNOWN_ROOM_PREFIXES:
+                continue  # skip room codes
+            if len(num) == 4:
+                continue  # 4-digit = room number, not course
+            course_code = f"{prefix} {num}"
+            # Strip section numbers like -01, -17 that OCR might merge
+            detected_courses.append(course_code)
+
+        detected_courses = list(dict.fromkeys(detected_courses))  # deduplicate, preserve order
+
+        if not detected_courses:
+            await update.message.reply_text(
+                "I read the image but couldn't detect any course codes.\n\n"
+                f"Debug - Raw OCR snippet:\n`{extracted_text[:300]}`",
+                parse_mode="Markdown"
+            )
             return
 
-        results_message = "🎓 *Here are your Spring 2026 Final Exams:*\n\n"
+        # Extract all times found
+        times_found = time_pattern.findall(extracted_text)
         
-        for course in set(detected_course_codes):
-            # Priority 1: Check if it's a common exam
+        # Convert "9:30 am" -> "09:30", "12:30 pm" -> "12:30", "3:30 pm" -> "15:30"
+        def to_24h(t, meridiem):
+            h, m = map(int, t.split(':'))
+            if meridiem.lower() == 'pm' and h != 12:
+                h += 12
+            if meridiem.lower() == 'am' and h == 12:
+                h = 0
+            return f"{h:02d}:{m:02d}"
+
+        times_24h = [to_24h(t, mer) for t, mer in times_found]
+
+        # Detect if timetable is MW or TR based on day names present in OCR
+        has_monday = bool(re.search(r'\b(Monday|Mon)\b', extracted_text, re.IGNORECASE))
+        has_tuesday = bool(re.search(r'\b(Tuesday|Tue)\b', extracted_text, re.IGNORECASE))
+
+        results_message = "🎓 *Your Spring 2026 Final Exams:*\n\n"
+        found_any = False
+
+        for course in detected_courses:
+            # Priority 1: Common exam
             if course in COMMON_EXAMS:
                 start_dt, end_dt = COMMON_EXAMS[course]
                 link = make_google_calendar_link_exam(course, start_dt, end_dt)
                 results_message += f"🏆 *{course}* (Common Exam)\n[📅 Add to Google Calendar]({link})\n\n"
-            
-            # Priority 2: Check standard scheduling based on detected class time
-            elif found_timings:
-                days, time = found_timings[0]
-                
-                # Standardize days and time 
-                if days in ['M', 'W']: days = 'MW'
-                if days in ['T', 'R']: days = 'TR'
-                if len(time) == 4: time = f"0{time}"
-                
-                if (days, time) in REGULAR_EXAMS:
-                    start_dt, end_dt = REGULAR_EXAMS[(days, time)]
-                    link = make_google_calendar_link_exam(course, start_dt, end_dt)
-                    results_message += f"📘 *{course}* (Regular Exam)\n[📅 Add to Google Calendar]({link})\n\n"
-                else:
-                    results_message += f"❓ *{course}* - I couldn't map the class time ({days} {time}) to the final schedule.\n\n"
-            else:
-                 results_message += f"❓ *{course}* - Found the course, but couldn't detect its class time on the timetable.\n\n"
+                found_any = True
+                continue
 
-        # 4. Output the results
+            # Priority 2: Match by timing
+            matched = False
+            for time_24h in times_24h:
+                # Format to HH:MM
+                time_str = time_24h  # already "09:30" etc.
+                
+                # Try both MW and TR
+                for day_key in [("MW", time_str), ("TR", time_str)]:
+                    if day_key in REGULAR_EXAMS:
+                        start_dt, end_dt = REGULAR_EXAMS[day_key]
+                        link = make_google_calendar_link_exam(course, start_dt, end_dt)
+                        day_label = "Mon/Wed" if day_key[0] == "MW" else "Tue/Thu"
+                        results_message += (
+                            f"📘 *{course}* ({day_label} {time_str})\n"
+                            f"[📅 Add to Google Calendar]({link})\n\n"
+                        )
+                        matched = True
+                        found_any = True
+                        break
+                if matched:
+                    break
+
+            if not matched:
+                results_message += f"❓ *{course}* — couldn't match to exam schedule.\n\n"
+
+        if not found_any:
+            results_message += "No courses could be matched to the Spring 2026 exam schedule."
+
         await update.message.reply_text(
             results_message,
             parse_mode="Markdown",
@@ -265,7 +318,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"Error processing image: {e}")
-        await update.message.reply_text("An error occurred while trying to process your image. Please ensure it's a valid timetable.")
+        await update.message.reply_text(f"❌ Error: {type(e).__name__}: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
